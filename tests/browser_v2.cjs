@@ -9,6 +9,7 @@ const path=require('node:path');
  const buildingFee='整栋测试费'+String(Date.now()).slice(-5),vehicleFee='指定车辆特别费'+String(Date.now()).slice(-5);
  await page.goto(base+'/#spaces');await page.locator('h1').waitFor();
  assert.match(await page.locator('main').innerText(),/车位状态与默认年度收费/);
+ assert.equal(await page.evaluate(()=>Boolean(document.querySelector('.space-status-panel').compareDocumentPosition(document.querySelector('.status-stats'))&Node.DOCUMENT_POSITION_FOLLOWING)),true);
  // Add a customizable status with split annual parking charges.
  await page.locator('[data-act="edit"][data-kind="space_statuses"]').first().click();
  await page.locator('[name="name"]').fill(statusName);await page.locator('[name="management_rate"]').fill('480');await page.locator('[name="public_rate"]').fill('1320');
