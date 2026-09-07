@@ -152,32 +152,32 @@ class AccountingTest(unittest.TestCase):
         self.assertEqual(app.read_sheet(output.getvalue(),'native.xlsx')[1],['2026-09-01'])
         with self.assertRaises(ValueError):app.save(self.c,'houses',dict(app.get(self.c,'houses',self.h),start='1900-01-01'))
 
-    def test_history_payment_import_is_atomic_grouped_and_duplicate_safe(self):
-        app.generate(self.c,'2026-01-01')
+    def test_history_payment_progress_import_is_simple_revisable_and_atomic(self):
+        app.generate(self.c)
         headers=[label for _,label in app.HISTORY_PAYMENT_COLUMNS]
-        def row(ref,receipt,item,period,amount,paid,house='H001'):
-            values={
-                'import_ref':ref,'receipt_ref':receipt,'house_id':house,'item':item,'period':period,
-                'amount':amount,'paid':paid,'payment_date':'2026-02-10','method':'银行转账','note':'历史迁移'
-            }
+        def row(until,expected='',number='101室',other='',parking=''):
+            values={'building':'1','unit':'1','number':number,'property_until':until,'other_until':other,'parking_until':parking,'expected_debt':expected,'note':'旧账迁移'}
             return [values.get(key,'') for key,_ in app.HISTORY_PAYMENT_COLUMNS]
         def payload(rows,preview):
             return {'filename':'history.xlsx','content':base64.b64encode(app.xlsx([headers]+rows)).decode(),'preview':preview}
-        rows=[row('HIST-001','RCPT-001','物业费','2026-01','250','250'),row('HIST-002','RCPT-001','历史清洁费','2027-09','80','50')]
-        preview=app.import_history_payments(self.c,payload(rows,True))
-        self.assertEqual((preview['count'],preview['matched_count'],preview['bill_count'],preview['payment_count']),(2,1,1,1))
+        alias_payload={'filename':'source.xlsx','content':base64.b64encode(app.xlsx([['楼号','单元号','房号','已缴至月份'],['1','1','101.0','2026年6月']])).decode(),'preview':True}
+        self.assertEqual(app.import_history_payments(self.c,alias_payload)['count'],1)
+        preview=app.import_history_payments(self.c,payload([row('2026-06','750')],True))
+        self.assertEqual((preview['count'],preview['bill_count'],preview['amount']),(1,6,150000))
         self.assertEqual(self.c.execute('SELECT COUNT(*) FROM payments').fetchone()[0],0)
-        result=app.import_history_payments(self.c,payload(rows,False))
-        self.assertTrue(result['committed']);self.assertEqual(self.c.execute('SELECT COUNT(*) FROM history_imports').fetchone()[0],2)
-        payment=self.c.execute('SELECT * FROM payments').fetchone();self.assertEqual(payment['amount'],30000)
-        self.assertEqual(self.c.execute('SELECT COUNT(*) FROM allocations WHERE payment_id=?',(payment['id'],)).fetchone()[0],2)
-        history=next(b for b in app.bills(self.c) if b['item']=='历史清洁费');self.assertEqual((history['amount'],history['paid']),(8000,5000))
-        duplicate=app.import_history_payments(self.c,payload(rows,False));self.assertEqual(len(duplicate['errors']),2)
-        counts=tuple(self.c.execute('SELECT (SELECT COUNT(*) FROM payments),(SELECT COUNT(*) FROM bills),(SELECT COUNT(*) FROM history_imports)').fetchone())
-        invalid=[row('HIST-003','RCPT-002','历史维修费','2025-11','30','30'),row('HIST-004','RCPT-002','历史维修费','2025-11','30','30','不存在')]
-        failed=app.import_history_payments(self.c,payload(invalid,False));self.assertTrue(failed['errors'])
-        self.assertEqual(tuple(self.c.execute('SELECT (SELECT COUNT(*) FROM payments),(SELECT COUNT(*) FROM bills),(SELECT COUNT(*) FROM history_imports)').fetchone()),counts)
-        too_far=app.import_history_payments(self.c,payload([row('HIST-005','RCPT-003','远期费用','2031-10','10','10')],False));self.assertTrue(too_far['errors'])
+        result=app.import_history_payments(self.c,payload([row('2026-06','750')],False))
+        self.assertTrue(result['committed']);payment=self.c.execute('SELECT * FROM payments').fetchone();self.assertEqual((payment['amount'],payment['opening']),(150000,1))
+        self.assertEqual(app.state(self.c)['payments'],[])
+        self.assertEqual(sum(b['amount']-b['paid'] for b in app.bills(self.c) if b['due']<=app.TODAY().isoformat()),75000)
+        revised=app.import_history_payments(self.c,payload([row('2026-08','250')],False));self.assertTrue(revised['committed'])
+        self.assertEqual(self.c.execute('SELECT COUNT(*) FROM payments').fetchone()[0],1);self.assertEqual(self.c.execute('SELECT amount FROM payments').fetchone()[0],200000)
+        mismatch=app.import_history_payments(self.c,payload([row('2026-07','999')],False));self.assertTrue(mismatch['errors'])
+        self.assertEqual(self.c.execute('SELECT property_until FROM opening_progress').fetchone()[0],'2026-08')
+        duplicate=app.import_history_payments(self.c,payload([row('2026-08'),row('2026-08')],False));self.assertTrue(duplicate['errors'])
+        self.assertEqual(self.c.execute('SELECT COUNT(*) FROM opening_progress').fetchone()[0],1)
+        future=app.import_history_payments(self.c,payload([row('2027-09')],False));self.assertTrue(future['committed'])
+        app.generate(self.c,'2027-09-01');self.assertTrue(all(b['paid']==b['amount'] for b in app.bills(self.c) if b['source']=='property' and b['period']<='2027-09'))
+        too_far=app.import_history_payments(self.c,payload([row('2031-10')],False));self.assertTrue(too_far['errors'])
 
     def test_bill_export_filters_and_money_columns(self):
         owner=app.save(self.c,'owners',dict(name='张女士',house_ids=[self.h]))
@@ -190,5 +190,19 @@ class AccountingTest(unittest.TestCase):
         paid=app.read_sheet(app.bill_export(self.c,{'start':'2026-01','end':'2026-03','status':'paid'}),'bills.xlsx')
         self.assertEqual(len(paid),1)
         with self.assertRaises(ValueError):app.bill_export(self.c,{'start':'2026-12','end':'2026-01'})
+
+    def test_payment_progress_can_reconcile_other_and_parking_charges(self):
+        app.save(self.c,'fees',dict(name='月度附加',target_type='all_houses',basis='固定金额',rate='10',cycle='每月',start='2026-01-01'))
+        app.save(self.c,'spaces',dict(number='P-01',kind='已租',house_id=self.h,start='2026-01-01'))
+        app.generate(self.c)
+        headers=[label for _,label in app.HISTORY_PAYMENT_COLUMNS]
+        values={'building':'1栋','unit':'1单元','number':'101','other_until':'2026-06','parking_until':'2026-12'}
+        row=[values.get(key,'') for key,_ in app.HISTORY_PAYMENT_COLUMNS]
+        payload={'filename':'progress.xlsx','content':base64.b64encode(app.xlsx([headers,row])).decode(),'preview':False}
+        result=app.import_history_payments(self.c,payload);self.assertFalse(result['errors'])
+        rows=app.bills(self.c)
+        self.assertTrue(all(b['paid']==b['amount'] for b in rows if b['item']=='月度附加' and b['period']<='2026-06'))
+        self.assertTrue(all(b['paid']==0 for b in rows if b['source']=='property'))
+        self.assertTrue(all(b['paid']==b['amount'] for b in rows if b['source'].startswith('spaces:')))
 
 if __name__=='__main__':unittest.main(verbosity=2)

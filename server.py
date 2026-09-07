@@ -52,10 +52,9 @@ DEFAULT_STATUSES = [
  {'id':'status-empty','name':'空闲','management_rate':'0','public_rate':'0','charge_management':False,'charge_public':False,'require_house':False,'active':True},
 ]
 HISTORY_PAYMENT_COLUMNS = [
- ('import_ref','导入编号'),('receipt_ref','同次收款号'),('bill_id','系统账单编号'),('house_id','房屋编号'),
- ('community','小区'),('building','楼栋'),('unit','单元'),('number','门牌号'),('item','费项名称'),
- ('period','账期'),('due','应缴日期'),('coverage_end','服务截止日期'),('amount','应收金额'),
- ('paid','实收金额'),('payment_date','收款日期'),('method','收款方式'),('note','备注')
+ ('community','小区（可不填）'),('building','楼栋'),('unit','单元'),('number','门牌号'),
+ ('property_until','物业费已缴至'),('other_until','其他房屋费已缴至（可不填）'),
+ ('parking_until','停车费已缴至（可不填）'),('expected_debt','当前欠款金额（可不填）'),('note','备注')
 ]
 
 class ClosingConnection(sqlite3.Connection):
@@ -80,16 +79,21 @@ def init_db():
           created TEXT NOT NULL,coverage_end TEXT NOT NULL DEFAULT '',group_key TEXT NOT NULL DEFAULT '',
           entity_type TEXT NOT NULL DEFAULT 'house',entity_id TEXT NOT NULL DEFAULT '',UNIQUE(house_id,source,period));
         CREATE TABLE IF NOT EXISTS payments (id TEXT PRIMARY KEY,date TEXT NOT NULL,amount INTEGER NOT NULL,
-          method TEXT NOT NULL,note TEXT NOT NULL,void INTEGER NOT NULL DEFAULT 0,created TEXT NOT NULL);
+          method TEXT NOT NULL,note TEXT NOT NULL,void INTEGER NOT NULL DEFAULT 0,created TEXT NOT NULL,
+          opening INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS allocations (payment_id TEXT NOT NULL REFERENCES payments(id),
           bill_id TEXT NOT NULL REFERENCES bills(id),amount INTEGER NOT NULL CHECK(amount>0),PRIMARY KEY(payment_id,bill_id));
         CREATE TABLE IF NOT EXISTS history_imports (ref TEXT PRIMARY KEY,payment_id TEXT NOT NULL REFERENCES payments(id),
           bill_id TEXT NOT NULL REFERENCES bills(id),created TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS opening_progress (house_id TEXT PRIMARY KEY,property_until TEXT NOT NULL DEFAULT '',
+          other_until TEXT NOT NULL DEFAULT '',parking_until TEXT NOT NULL DEFAULT '',note TEXT NOT NULL DEFAULT '',updated TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT,time TEXT NOT NULL,action TEXT NOT NULL,data TEXT NOT NULL);
         ''')
         columns={r[1] for r in c.execute('PRAGMA table_info(bills)')}
         for name,definition in [('coverage_end',"TEXT NOT NULL DEFAULT ''"),('group_key',"TEXT NOT NULL DEFAULT ''"),('entity_type',"TEXT NOT NULL DEFAULT 'house'"),('entity_id',"TEXT NOT NULL DEFAULT ''")]:
             if name not in columns: c.execute(f'ALTER TABLE bills ADD COLUMN {name} {definition}')
+        payment_columns={r[1] for r in c.execute('PRAGMA table_info(payments)')}
+        if 'opening' not in payment_columns: c.execute("ALTER TABLE payments ADD COLUMN opening INTEGER NOT NULL DEFAULT 0")
         c.execute('INSERT OR IGNORE INTO settings VALUES(1,?)',(json.dumps(DEFAULTS),))
         current=json.loads(c.execute('SELECT data FROM settings WHERE id=1').fetchone()[0])
         merged={**DEFAULTS,**current}
@@ -394,6 +398,7 @@ def generate(c, until=None, only_house=None):
             item=f['name']+((' · '+entity_name) if entity_type!='house' else '')
             source=f"fees:{f['id']}:{entity_type}:{entity['id']}"
             issue(h,source,item,rate,start,f['cycle'],f['end'],entity_type,entity['id'],f"fee:{f['id']}:{entity_type}:{entity['id']}",f.get('interval_months',''))
+    if count: reconcile_opening_progress(c,[only_house] if only_house else None)
     return count
 
 def bills(c):
@@ -469,8 +474,8 @@ def state(c):
             item=grouped.setdefault(b['group_key'],{'house_id':b['house_id'],'space_id':b['entity_id'],'due':b['due'],'amount':0,'items':[]})
             item['amount']+=b['amount']-b['paid']; item['items'].append(b['item'])
     reminders=list(grouped.values())
-    data.update(settings=config,bills=current_bills,payments=[dict(r) for r in c.execute('SELECT * FROM payments ORDER BY created DESC, rowid DESC')],
-      allocations=[dict(r) for r in c.execute('SELECT * FROM allocations')],
+    data.update(settings=config,bills=current_bills,payments=[dict(r) for r in c.execute('SELECT * FROM payments WHERE opening=0 ORDER BY created DESC, rowid DESC')],
+      allocations=[dict(r) for r in c.execute('SELECT a.* FROM allocations a JOIN payments p ON p.id=a.payment_id WHERE p.opening=0')],
       reminders=reminders,audit=[dict(r) for r in c.execute('SELECT * FROM audit ORDER BY id DESC LIMIT 300')],today=TODAY().isoformat(),time=now())
     return data
 
@@ -602,7 +607,7 @@ def bill_export(c, filters):
     return xlsx(rows)
 
 def history_period(value):
-    value=str(value or '').strip()
+    value=str(value or '').strip().replace('年','-').replace('月','').replace('/','-').replace('.','-')
     match=re.fullmatch(r'(\d{4})-(\d{1,2})(?:-\d{1,2})?',value)
     if not match: raise ValueError('账期格式应为 YYYY-MM')
     year,month_number=int(match.group(1)),int(match.group(2))
@@ -611,98 +616,112 @@ def history_period(value):
     if result>add_month(TODAY().replace(day=1),60): raise ValueError('账期不能超过当前月份后5年')
     return result.strftime('%Y-%m')
 
-def history_house(c,row):
-    key=str(row.get('house_id','')).strip()
-    address={k:str(row.get(k,'')).strip() for k in ['community','building','unit','number']}
-    if key:
-        h=get(c,'houses',key)
-        for field,value in address.items():
-            if value and h[field]!=value: raise ValueError('房屋编号与填写的'+LABELS[field]+'不一致')
-        return h
-    if not all(address.values()): raise ValueError('请填写房屋编号，或完整填写小区、楼栋、单元和门牌号')
-    matches=[h for h in records(c,'houses') if all(h[k]==v for k,v in address.items())]
-    if len(matches)!=1: raise ValueError('无法按地址唯一匹配房屋，请改填房屋编号')
-    return matches[0]
+def address_token(value,kind=''):
+    value=re.sub(r'\s+','',str(value or '')).lower()
+    if re.fullmatch(r'\d+\.0',value): value=value[:-2]
+    suffix={'building':r'(号楼|栋|幢)$','unit':r'单元$','number':r'(室|号)$'}.get(kind)
+    return re.sub(suffix,'',value) if suffix else value
+
+def opening_payment_id(house_id,category):
+    return 'opening-'+uuid.uuid5(uuid.NAMESPACE_URL,'tutu-opening:'+house_id+':'+category).hex
+
+def reconcile_opening_progress(c,house_ids=None):
+    progress=[dict(r) for r in c.execute('SELECT * FROM opening_progress')]
+    if house_ids is not None:
+        allowed=set(x for x in house_ids if x); progress=[p for p in progress if p['house_id'] in allowed]
+    categories={'property':('property_until','物业费'),'other':('other_until','其他房屋费'),'parking':('parking_until','停车费')}
+    for p in progress:
+        for category in categories:
+            payment_id=opening_payment_id(p['house_id'],category)
+            c.execute('DELETE FROM allocations WHERE payment_id=?',(payment_id,))
+            c.execute('DELETE FROM payments WHERE id=?',(payment_id,))
+    grouped={}
+    for b in bills(c): grouped.setdefault(b['house_id'],[]).append(b)
+    bill_count=0; total=0
+    for p in progress:
+        for category,(field,label) in categories.items():
+            until=p.get(field,'')
+            if not until: continue
+            selected=[]
+            for b in grouped.get(p['house_id'],[]):
+                matches=category=='property' and b['source']=='property' or category=='other' and b['source'].startswith('fees:') or category=='parking' and b['source'].startswith('spaces:')
+                through=(b.get('coverage_end') or b['due'])[:7] if category=='parking' else b['period']
+                remaining=b['amount']-b['paid']
+                if matches and through<=until and remaining>0: selected.append((b['id'],remaining))
+            if not selected: continue
+            payment_id=opening_payment_id(p['house_id'],category); amount=sum(x[1] for x in selected)
+            note=label+'已缴至 '+until+(('；'+p['note']) if p.get('note') else '')
+            c.execute('INSERT INTO payments(id,date,amount,method,note,void,created,opening) VALUES(?,?,?,?,?,0,?,1)',(payment_id,TODAY().isoformat(),amount,'期初迁移',note,now()))
+            for bill_id,value in selected: c.execute('INSERT INTO allocations VALUES(?,?,?)',(payment_id,bill_id,value))
+            bill_count+=len(selected); total+=amount
+    return {'bill_count':bill_count,'amount':total}
 
 def import_history_payments(c,data):
     rows=read_sheet(base64.b64decode(data['content']),data['filename'])
     if not rows: raise ValueError('表格为空')
     aliases={label:key for key,label in HISTORY_PAYMENT_COLUMNS}; aliases.update({key:key for key,_ in HISTORY_PAYMENT_COLUMNS})
+    aliases.update({'小区':'community','小区名称':'community','项目':'community','楼号':'building','栋号':'building','楼座':'building',
+      '单元号':'unit','房号':'number','房间号':'number','已缴至':'property_until','已缴至月份':'property_until',
+      '物业费缴至':'property_until','缴费截止月份':'property_until','物业费截止月份':'property_until',
+      '其他费已缴至':'other_until','停车费缴至':'parking_until','当前欠费':'expected_debt','欠费金额':'expected_debt','备注信息':'note'})
     cols=[aliases.get(str(x).strip()) for x in rows[0]]
-    if not any(cols): raise ValueError('未识别表头，请下载往期缴费模板')
-    required={'import_ref','item','period','amount','paid','payment_date'}
+    if not any(cols): raise ValueError('未识别表头，请下载缴费进度模板')
+    required={'building','unit','number','property_until'}
     if not required.issubset({x for x in cols if x}):
         missing=[dict(HISTORY_PAYMENT_COLUMNS)[key] for key in required if key not in cols]
         raise ValueError('缺少必要表头：'+'、'.join(missing))
     c.execute('SAVEPOINT history_payment_batch')
-    errors=[]; prepared=[]; seen_refs=set(); planned={}; groups={}; created_bills=0; matched_bills=0
-    available={b['id']:b for b in bills(c)}
+    errors=[]; prepared=[]; seen_houses=set(); all_houses=records(c,'houses')
+    by_full={};by_short={}
+    for h in all_houses:
+        full=(address_token(h['community']),address_token(h['building'],'building'),address_token(h['unit'],'unit'),address_token(h['number'],'number'))
+        short=full[1:];by_full.setdefault(full,[]).append(h);by_short.setdefault(short,[]).append(h)
     for line,values in enumerate(rows[1:],2):
         if not any(str(x).strip() for x in values): continue
         row={key:str(values[i]).strip() for i,key in enumerate(cols) if key and i<len(values)}
         try:
-            ref=row.get('import_ref','')
-            if not ref: raise ValueError('导入编号不能为空')
-            if len(ref)>100: raise ValueError('导入编号不能超过100个字符')
-            if ref in seen_refs: raise ValueError('本文件中的导入编号重复')
-            seen_refs.add(ref)
-            if c.execute('SELECT 1 FROM history_imports WHERE ref=?',(ref,)).fetchone(): raise ValueError('该导入编号已经导入，请勿重复提交')
-            h=history_house(c,row); item=row.get('item','').strip()
-            if not item: raise ValueError('费项名称不能为空')
-            period=history_period(row.get('period'))
-            amount=money(row.get('amount')); paid=money(row.get('paid'))
-            if amount<=0 or paid<=0: raise ValueError('应收金额和实收金额必须大于0')
-            if paid>amount: raise ValueError('实收金额不能超过应收金额')
-            paid_date=date(row.get('payment_date'))
-            if paid_date>TODAY(): raise ValueError('收款日期不能在未来')
-            due=date(row.get('due') or period+'-01')
-            coverage_end=date(row.get('coverage_end') or due.isoformat())
-            if coverage_end<due: raise ValueError('服务截止日期不能早于应缴日期')
-            bill=None; requested=row.get('bill_id','')
-            if requested:
-                bill=available.get(requested)
-                if not bill: raise ValueError('系统账单编号不存在')
-                if bill['house_id']!=h['id'] or bill['period']!=period or bill['item']!=item: raise ValueError('系统账单编号与房屋、账期或费项不一致')
-            else:
-                candidates=[b for b in available.values() if b['house_id']==h['id'] and b['period']==period and b['item']==item]
-                exact=[b for b in candidates if b['amount']==amount and b['amount']-b['paid']-planned.get(b['id'],0)>=paid]
-                if len(exact)==1: bill=exact[0]
-                elif len(exact)>1: raise ValueError('存在多张相同账单，请填写系统账单编号')
-                elif len(candidates)==1 and candidates[0]['paid']==0 and planned.get(candidates[0]['id'],0)==0:
-                    bill=candidates[0];c.execute('UPDATE bills SET amount=? WHERE id=?',(amount,bill['id']));bill['amount']=amount
-                elif candidates: raise ValueError('已有同房屋、账期和费项的账单，但金额或剩余应缴不匹配')
-            if bill is None:
-                bill_id='histbill-'+uuid.uuid5(uuid.NAMESPACE_URL,'tutu-history-bill:'+ref).hex
-                source='history-import:'+uuid.uuid5(uuid.NAMESPACE_URL,'tutu-history-source:'+ref).hex
-                c.execute('''INSERT INTO bills(id,house_id,source,period,item,amount,due,created,coverage_end,group_key,entity_type,entity_id)
-                  VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',(bill_id,h['id'],source,period,item,amount,due.isoformat(),now(),coverage_end.isoformat(),source,'house',h['id']))
-                bill={'id':bill_id,'house_id':h['id'],'source':source,'period':period,'item':item,'amount':amount,'paid':0,'due':due.isoformat(),'coverage_end':coverage_end.isoformat()}
-                available[bill_id]=bill;created_bills+=1
-            else: matched_bills+=1
-            remaining=bill['amount']-bill['paid']-planned.get(bill['id'],0)
-            if paid>remaining: raise ValueError('实收金额超过该账单剩余应缴金额')
-            planned[bill['id']]=planned.get(bill['id'],0)+paid
-            receipt=row.get('receipt_ref','') or ref
-            if len(receipt)>100: raise ValueError('同次收款号不能超过100个字符')
-            payment_id='histpay-'+uuid.uuid5(uuid.NAMESPACE_URL,'tutu-history-payment:'+receipt).hex
-            if c.execute('SELECT 1 FROM payments WHERE id=?',(payment_id,)).fetchone(): raise ValueError('该同次收款号已经导入，请勿重复提交')
-            method=row.get('method','') or '现金'; note=row.get('note','')
-            group=groups.setdefault(payment_id,{'date':paid_date.isoformat(),'method':method,'note':note,'receipt':receipt,'allocations':{}})
-            if (group['date'],group['method'],group['note'])!=(paid_date.isoformat(),method,note): raise ValueError('同次收款号的收款日期、方式和备注必须一致')
-            group['allocations'][bill['id']]=group['allocations'].get(bill['id'],0)+paid
-            prepared.append({'ref':ref,'payment_id':payment_id,'bill_id':bill['id']})
-        except (ValueError,KeyError,sqlite3.IntegrityError) as e: errors.append({'row':line,'message':str(e)})
+            for key in ['building','unit','number']:
+                if not row.get(key): raise ValueError(dict(HISTORY_PAYMENT_COLUMNS)[key]+'不能为空')
+            short=(address_token(row['building'],'building'),address_token(row['unit'],'unit'),address_token(row['number'],'number'))
+            if row.get('community'):
+                matches=by_full.get((address_token(row['community']),)+short,[])
+            else: matches=by_short.get(short,[])
+            if len(matches)!=1: raise ValueError('无法按楼栋、单元、门牌号唯一匹配房屋'+('，请补充小区' if len(matches)>1 else ''))
+            h=matches[0]
+            if h['id'] in seen_houses: raise ValueError('同一套房屋只能填写一行')
+            seen_houses.add(h['id'])
+            cutoffs={key:history_period(row[key]) if row.get(key) else '' for key in ['property_until','other_until','parking_until']}
+            existing=c.execute('SELECT * FROM opening_progress WHERE house_id=?',(h['id'],)).fetchone()
+            merged={key:cutoffs[key] or (existing[key] if existing else '') for key in cutoffs}
+            if not any(merged.values()): raise ValueError('至少填写一个“已缴至”月份')
+            expected=money(row['expected_debt']) if row.get('expected_debt') else None
+            note=row.get('note','') or (existing['note'] if existing else '')
+            c.execute('''INSERT INTO opening_progress(house_id,property_until,other_until,parking_until,note,updated) VALUES(?,?,?,?,?,?)
+              ON CONFLICT(house_id) DO UPDATE SET property_until=excluded.property_until,other_until=excluded.other_until,
+              parking_until=excluded.parking_until,note=excluded.note,updated=excluded.updated''',(h['id'],merged['property_until'],merged['other_until'],merged['parking_until'],note,now()))
+            prepared.append({'row':line,'house':h,'expected':expected,'cutoffs':merged})
+        except (ValueError,KeyError,sqlite3.IntegrityError) as e:
+            errors.append({'row':line,'message':str(e)})
     if not prepared and not errors: errors.append({'row':2,'message':'表格没有可导入的数据'})
     if not errors:
-        for payment_id,group in groups.items():
-            total=sum(group['allocations'].values())
-            c.execute('INSERT INTO payments(id,date,amount,method,note,void,created) VALUES(?,?,?,?,?,0,?)',(payment_id,group['date'],total,group['method'],group['note'],now()))
-            for bill_id,value in group['allocations'].items(): c.execute('INSERT INTO allocations VALUES(?,?,?)',(payment_id,bill_id,value))
-        for row in prepared: c.execute('INSERT INTO history_imports VALUES(?,?,?,?)',(row['ref'],row['payment_id'],row['bill_id'],now()))
-        audit(c,'批量导入往期缴费',{'rows':len(prepared),'bills_created':created_bills,'bills_matched':matched_bills,'payments':len(groups),'refs':[x['ref'] for x in prepared]})
+        generated=generate(c)
+        if not generated: reconcile_opening_progress(c,[x['house']['id'] for x in prepared])
+        current=bills(c)
+        for item in prepared:
+            if item['expected'] is None: continue
+            debt=sum(b['amount']-b['paid'] for b in current if b['house_id']==item['house']['id'] and b['due']<=TODAY().isoformat())
+            if debt!=item['expected']: errors.append({'row':item['row'],'message':'导入后系统欠款为 '+yuan_text(debt)+' 元，与填写的当前欠款 '+yuan_text(item['expected'])+' 元不一致，请检查费率、起算月份或其他费项'})
+    imported_ids={x['house']['id'] for x in prepared}
+    payment_ids={opening_payment_id(h,category) for h in imported_ids for category in ['property','other','parking']}
+    placeholders=','.join('?' for _ in payment_ids)
+    allocation_rows=[]
+    if payment_ids: allocation_rows=list(c.execute('SELECT a.amount FROM allocations a WHERE a.payment_id IN ('+placeholders+')',tuple(payment_ids)))
+    paid_amount=sum(r['amount'] for r in allocation_rows); paid_bills=len(allocation_rows)
+    if not errors:
+        audit(c,'批量导入缴费进度',{'houses':len(prepared),'paid_bills':paid_bills,'opening_amount':paid_amount,'house_ids':sorted(imported_ids)})
     if errors or data.get('preview',True): c.execute('ROLLBACK TO history_payment_batch')
     c.execute('RELEASE history_payment_batch')
-    return {'count':len(prepared),'bill_count':created_bills,'matched_count':matched_bills,'payment_count':len(groups),'errors':errors,'committed':not errors and not data.get('preview',True)}
+    return {'count':len(prepared),'bill_count':paid_bills,'amount':paid_amount,'errors':errors,'committed':not errors and not data.get('preview',True)}
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self,*args): pass
@@ -731,7 +750,7 @@ class Handler(BaseHTTPRequestHandler):
             if u.path=='/api/backup':
                 with LOCK,connect() as c:
                     result={k:records(c,k) for k in TABLES}
-                    result.update(format=1,settings=settings(c),bills=[dict(r) for r in c.execute('SELECT * FROM bills')],payments=[dict(r) for r in c.execute('SELECT * FROM payments')],allocations=[dict(r) for r in c.execute('SELECT * FROM allocations')],history_imports=[dict(r) for r in c.execute('SELECT * FROM history_imports')],audit=[dict(r) for r in c.execute('SELECT * FROM audit')])
+                    result.update(format=1,settings=settings(c),bills=[dict(r) for r in c.execute('SELECT * FROM bills')],payments=[dict(r) for r in c.execute('SELECT * FROM payments')],allocations=[dict(r) for r in c.execute('SELECT * FROM allocations')],history_imports=[dict(r) for r in c.execute('SELECT * FROM history_imports')],opening_progress=[dict(r) for r in c.execute('SELECT * FROM opening_progress')],audit=[dict(r) for r in c.execute('SELECT * FROM audit')])
                 return self.reply(json.dumps(result,ensure_ascii=False,indent=2).encode(),ctype='application/json',filename='tutu-property-backup-'+TODAY().isoformat()+'.json')
             path={'/':'index.html','/app.js':'app.js','/style.css':'style.css'}.get(u.path)
             if not path: return self.reply({'error':'未找到'},404)
@@ -789,7 +808,7 @@ class Handler(BaseHTTPRequestHandler):
                     dest=DB_PATH.parent/'backups'; dest.mkdir(parents=True,exist_ok=True)
                     dest_file=dest/('before-restore-'+dt.datetime.now().strftime('%Y%m%d-%H%M%S-%f')+'.db')
                     with sqlite3.connect(dest_file, factory=ClosingConnection) as target: c.backup(target)
-                    for table in ['history_imports','allocations','payments','bills','records','audit']: c.execute('DELETE FROM '+table)
+                    for table in ['history_imports','allocations','payments','bills','opening_progress','records','audit']: c.execute('DELETE FROM '+table)
                     c.execute('UPDATE settings SET data=? WHERE id=1',(json.dumps({**DEFAULTS,**backup['settings']}),))
                     for kind in TABLES:
                         for r in backup.get(kind,[]):
@@ -799,9 +818,9 @@ class Handler(BaseHTTPRequestHandler):
                             if kind=='fees' and 'target_type' not in r:
                                 old=r.pop('house_id','');r.update(target_type='house' if old else 'all_houses',target_community='',target_building='',target_unit='',target_id=old,interval_months='')
                             c.execute('INSERT INTO records VALUES(?,?,?)',(kind,key,json.dumps(r)))
-                    for table in ['bills','payments','allocations','history_imports','audit']:
+                    for table in ['bills','payments','allocations','history_imports','opening_progress','audit']:
                         columns=[r[1] for r in c.execute('PRAGMA table_info('+table+')')]
-                        defaults={'coverage_end':'','group_key':'','entity_type':'house','entity_id':''}
+                        defaults={'coverage_end':'','group_key':'','entity_type':'house','entity_id':'','opening':0}
                         for r in backup.get(table,[]): c.execute('INSERT INTO '+table+'('+','.join(columns)+') VALUES('+','.join('?' for _ in columns)+')',[r.get(k,defaults.get(k)) for k in columns])
                     if not c.execute("SELECT 1 FROM records WHERE kind='space_statuses'").fetchone():
                         for status in DEFAULT_STATUSES:
