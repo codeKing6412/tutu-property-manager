@@ -152,4 +152,43 @@ class AccountingTest(unittest.TestCase):
         self.assertEqual(app.read_sheet(output.getvalue(),'native.xlsx')[1],['2026-09-01'])
         with self.assertRaises(ValueError):app.save(self.c,'houses',dict(app.get(self.c,'houses',self.h),start='1900-01-01'))
 
+    def test_history_payment_import_is_atomic_grouped_and_duplicate_safe(self):
+        app.generate(self.c,'2026-01-01')
+        headers=[label for _,label in app.HISTORY_PAYMENT_COLUMNS]
+        def row(ref,receipt,item,period,amount,paid,house='H001'):
+            values={
+                'import_ref':ref,'receipt_ref':receipt,'house_id':house,'item':item,'period':period,
+                'amount':amount,'paid':paid,'payment_date':'2026-02-10','method':'银行转账','note':'历史迁移'
+            }
+            return [values.get(key,'') for key,_ in app.HISTORY_PAYMENT_COLUMNS]
+        def payload(rows,preview):
+            return {'filename':'history.xlsx','content':base64.b64encode(app.xlsx([headers]+rows)).decode(),'preview':preview}
+        rows=[row('HIST-001','RCPT-001','物业费','2026-01','250','250'),row('HIST-002','RCPT-001','历史清洁费','2027-09','80','50')]
+        preview=app.import_history_payments(self.c,payload(rows,True))
+        self.assertEqual((preview['count'],preview['matched_count'],preview['bill_count'],preview['payment_count']),(2,1,1,1))
+        self.assertEqual(self.c.execute('SELECT COUNT(*) FROM payments').fetchone()[0],0)
+        result=app.import_history_payments(self.c,payload(rows,False))
+        self.assertTrue(result['committed']);self.assertEqual(self.c.execute('SELECT COUNT(*) FROM history_imports').fetchone()[0],2)
+        payment=self.c.execute('SELECT * FROM payments').fetchone();self.assertEqual(payment['amount'],30000)
+        self.assertEqual(self.c.execute('SELECT COUNT(*) FROM allocations WHERE payment_id=?',(payment['id'],)).fetchone()[0],2)
+        history=next(b for b in app.bills(self.c) if b['item']=='历史清洁费');self.assertEqual((history['amount'],history['paid']),(8000,5000))
+        duplicate=app.import_history_payments(self.c,payload(rows,False));self.assertEqual(len(duplicate['errors']),2)
+        counts=tuple(self.c.execute('SELECT (SELECT COUNT(*) FROM payments),(SELECT COUNT(*) FROM bills),(SELECT COUNT(*) FROM history_imports)').fetchone())
+        invalid=[row('HIST-003','RCPT-002','历史维修费','2025-11','30','30'),row('HIST-004','RCPT-002','历史维修费','2025-11','30','30','不存在')]
+        failed=app.import_history_payments(self.c,payload(invalid,False));self.assertTrue(failed['errors'])
+        self.assertEqual(tuple(self.c.execute('SELECT (SELECT COUNT(*) FROM payments),(SELECT COUNT(*) FROM bills),(SELECT COUNT(*) FROM history_imports)').fetchone()),counts)
+        too_far=app.import_history_payments(self.c,payload([row('HIST-005','RCPT-003','远期费用','2031-10','10','10')],False));self.assertTrue(too_far['errors'])
+
+    def test_bill_export_filters_and_money_columns(self):
+        owner=app.save(self.c,'owners',dict(name='张女士',house_ids=[self.h]))
+        app.save(self.c,'houses',dict(app.get(self.c,'houses',self.h),contact_id=owner))
+        app.generate(self.c,'2026-03-01');bill=app.bills(self.c)[0]
+        app.pay(self.c,{'date':'2026-02-10','allocations':[{'bill_id':bill['id'],'amount':'100'}]})
+        rows=app.read_sheet(app.bill_export(self.c,{'start':'2026-01','end':'2026-01','house_id':self.h,'item':'物业费','status':'unpaid'}),'bills.xlsx')
+        self.assertEqual(len(rows),2);self.assertEqual(rows[1][1],'H001');self.assertEqual(rows[1][6],'张女士')
+        self.assertEqual(rows[1][11:14],['250.00','100.00','150.00'])
+        paid=app.read_sheet(app.bill_export(self.c,{'start':'2026-01','end':'2026-03','status':'paid'}),'bills.xlsx')
+        self.assertEqual(len(paid),1)
+        with self.assertRaises(ValueError):app.bill_export(self.c,{'start':'2026-12','end':'2026-01'})
+
 if __name__=='__main__':unittest.main(verbosity=2)

@@ -51,6 +51,12 @@ DEFAULT_STATUSES = [
  {'id':'status-temporary','name':'临停','management_rate':'0','public_rate':'0','charge_management':False,'charge_public':False,'require_house':False,'active':True},
  {'id':'status-empty','name':'空闲','management_rate':'0','public_rate':'0','charge_management':False,'charge_public':False,'require_house':False,'active':True},
 ]
+HISTORY_PAYMENT_COLUMNS = [
+ ('import_ref','导入编号'),('receipt_ref','同次收款号'),('bill_id','系统账单编号'),('house_id','房屋编号'),
+ ('community','小区'),('building','楼栋'),('unit','单元'),('number','门牌号'),('item','费项名称'),
+ ('period','账期'),('due','应缴日期'),('coverage_end','服务截止日期'),('amount','应收金额'),
+ ('paid','实收金额'),('payment_date','收款日期'),('method','收款方式'),('note','备注')
+]
 
 class ClosingConnection(sqlite3.Connection):
     def __exit__(self, *args):
@@ -77,6 +83,8 @@ def init_db():
           method TEXT NOT NULL,note TEXT NOT NULL,void INTEGER NOT NULL DEFAULT 0,created TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS allocations (payment_id TEXT NOT NULL REFERENCES payments(id),
           bill_id TEXT NOT NULL REFERENCES bills(id),amount INTEGER NOT NULL CHECK(amount>0),PRIMARY KEY(payment_id,bill_id));
+        CREATE TABLE IF NOT EXISTS history_imports (ref TEXT PRIMARY KEY,payment_id TEXT NOT NULL REFERENCES payments(id),
+          bill_id TEXT NOT NULL REFERENCES bills(id),created TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT,time TEXT NOT NULL,action TEXT NOT NULL,data TEXT NOT NULL);
         ''')
         columns={r[1] for r in c.execute('PRAGMA table_info(bills)')}
@@ -563,6 +571,139 @@ def import_rows(c, kind, data):
     c.execute('RELEASE import_batch')
     return {'count':count,'errors':errors,'committed':not errors and not data.get('preview',True)}
 
+def history_payment_template():
+    return xlsx([[label for _,label in HISTORY_PAYMENT_COLUMNS]])
+
+def yuan_text(cents):
+    return format((Decimal(cents)/Decimal(100)).quantize(Decimal('0.01')),'f')
+
+def bill_export(c, filters):
+    start=str(filters.get('start','')).strip(); end=str(filters.get('end','')).strip()
+    for value,label in [(start,'起始月份'),(end,'结束月份')]:
+        if value and not re.fullmatch(r'\d{4}-(0[1-9]|1[0-2])',value): raise ValueError(label+'格式应为 YYYY-MM')
+    if start and end and start>end: raise ValueError('结束月份不能早于起始月份')
+    house_id=str(filters.get('house_id','')).strip()
+    if house_id: get(c,'houses',house_id)
+    item=str(filters.get('item','')).strip(); status=str(filters.get('status','all')).strip() or 'all'
+    if status not in ['all','unpaid','overdue','paid']: raise ValueError('账单状态筛选无效')
+    house_map={h['id']:h for h in records(c,'houses')}; owner_map={o['id']:o for o in records(c,'owners')}
+    headers=['账单编号','房屋编号','小区','楼栋','单元','门牌号','业主 / 联系人','费项名称','账期','应缴日期','服务截止日期','应收金额','已收金额','未收金额','状态','账单来源']
+    rows=[headers]
+    for b in bills(c):
+        if start and b['period']<start or end and b['period']>end or house_id and b['house_id']!=house_id or item and b['item']!=item: continue
+        unpaid=b['paid']<b['amount']; overdue=unpaid and b['due']<=TODAY().isoformat()
+        if status=='unpaid' and not unpaid or status=='overdue' and not overdue or status=='paid' and unpaid: continue
+        h=house_map.get(b['house_id'],{})
+        owner=owner_map.get(h.get('contact_id'))
+        if not owner:
+            owner=next((o for o in owner_map.values() if h.get('id') in o.get('house_ids',[])),None)
+        state='已缴清' if not unpaid else '已逾期' if overdue else '待缴 / 可预缴'
+        rows.append([b['id'],b['house_id'],h.get('community',''),h.get('building',''),h.get('unit',''),h.get('number',''),owner.get('name','') if owner else '',b['item'],b['period'],b['due'],b.get('coverage_end',''),yuan_text(b['amount']),yuan_text(b['paid']),yuan_text(b['amount']-b['paid']),state,b['source']])
+    return xlsx(rows)
+
+def history_period(value):
+    value=str(value or '').strip()
+    match=re.fullmatch(r'(\d{4})-(\d{1,2})(?:-\d{1,2})?',value)
+    if not match: raise ValueError('账期格式应为 YYYY-MM')
+    year,month_number=int(match.group(1)),int(match.group(2))
+    try: result=dt.date(year,month_number,1)
+    except ValueError: raise ValueError('账期月份无效')
+    if result>add_month(TODAY().replace(day=1),60): raise ValueError('账期不能超过当前月份后5年')
+    return result.strftime('%Y-%m')
+
+def history_house(c,row):
+    key=str(row.get('house_id','')).strip()
+    address={k:str(row.get(k,'')).strip() for k in ['community','building','unit','number']}
+    if key:
+        h=get(c,'houses',key)
+        for field,value in address.items():
+            if value and h[field]!=value: raise ValueError('房屋编号与填写的'+LABELS[field]+'不一致')
+        return h
+    if not all(address.values()): raise ValueError('请填写房屋编号，或完整填写小区、楼栋、单元和门牌号')
+    matches=[h for h in records(c,'houses') if all(h[k]==v for k,v in address.items())]
+    if len(matches)!=1: raise ValueError('无法按地址唯一匹配房屋，请改填房屋编号')
+    return matches[0]
+
+def import_history_payments(c,data):
+    rows=read_sheet(base64.b64decode(data['content']),data['filename'])
+    if not rows: raise ValueError('表格为空')
+    aliases={label:key for key,label in HISTORY_PAYMENT_COLUMNS}; aliases.update({key:key for key,_ in HISTORY_PAYMENT_COLUMNS})
+    cols=[aliases.get(str(x).strip()) for x in rows[0]]
+    if not any(cols): raise ValueError('未识别表头，请下载往期缴费模板')
+    required={'import_ref','item','period','amount','paid','payment_date'}
+    if not required.issubset({x for x in cols if x}):
+        missing=[dict(HISTORY_PAYMENT_COLUMNS)[key] for key in required if key not in cols]
+        raise ValueError('缺少必要表头：'+'、'.join(missing))
+    c.execute('SAVEPOINT history_payment_batch')
+    errors=[]; prepared=[]; seen_refs=set(); planned={}; groups={}; created_bills=0; matched_bills=0
+    available={b['id']:b for b in bills(c)}
+    for line,values in enumerate(rows[1:],2):
+        if not any(str(x).strip() for x in values): continue
+        row={key:str(values[i]).strip() for i,key in enumerate(cols) if key and i<len(values)}
+        try:
+            ref=row.get('import_ref','')
+            if not ref: raise ValueError('导入编号不能为空')
+            if len(ref)>100: raise ValueError('导入编号不能超过100个字符')
+            if ref in seen_refs: raise ValueError('本文件中的导入编号重复')
+            seen_refs.add(ref)
+            if c.execute('SELECT 1 FROM history_imports WHERE ref=?',(ref,)).fetchone(): raise ValueError('该导入编号已经导入，请勿重复提交')
+            h=history_house(c,row); item=row.get('item','').strip()
+            if not item: raise ValueError('费项名称不能为空')
+            period=history_period(row.get('period'))
+            amount=money(row.get('amount')); paid=money(row.get('paid'))
+            if amount<=0 or paid<=0: raise ValueError('应收金额和实收金额必须大于0')
+            if paid>amount: raise ValueError('实收金额不能超过应收金额')
+            paid_date=date(row.get('payment_date'))
+            if paid_date>TODAY(): raise ValueError('收款日期不能在未来')
+            due=date(row.get('due') or period+'-01')
+            coverage_end=date(row.get('coverage_end') or due.isoformat())
+            if coverage_end<due: raise ValueError('服务截止日期不能早于应缴日期')
+            bill=None; requested=row.get('bill_id','')
+            if requested:
+                bill=available.get(requested)
+                if not bill: raise ValueError('系统账单编号不存在')
+                if bill['house_id']!=h['id'] or bill['period']!=period or bill['item']!=item: raise ValueError('系统账单编号与房屋、账期或费项不一致')
+            else:
+                candidates=[b for b in available.values() if b['house_id']==h['id'] and b['period']==period and b['item']==item]
+                exact=[b for b in candidates if b['amount']==amount and b['amount']-b['paid']-planned.get(b['id'],0)>=paid]
+                if len(exact)==1: bill=exact[0]
+                elif len(exact)>1: raise ValueError('存在多张相同账单，请填写系统账单编号')
+                elif len(candidates)==1 and candidates[0]['paid']==0 and planned.get(candidates[0]['id'],0)==0:
+                    bill=candidates[0];c.execute('UPDATE bills SET amount=? WHERE id=?',(amount,bill['id']));bill['amount']=amount
+                elif candidates: raise ValueError('已有同房屋、账期和费项的账单，但金额或剩余应缴不匹配')
+            if bill is None:
+                bill_id='histbill-'+uuid.uuid5(uuid.NAMESPACE_URL,'tutu-history-bill:'+ref).hex
+                source='history-import:'+uuid.uuid5(uuid.NAMESPACE_URL,'tutu-history-source:'+ref).hex
+                c.execute('''INSERT INTO bills(id,house_id,source,period,item,amount,due,created,coverage_end,group_key,entity_type,entity_id)
+                  VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',(bill_id,h['id'],source,period,item,amount,due.isoformat(),now(),coverage_end.isoformat(),source,'house',h['id']))
+                bill={'id':bill_id,'house_id':h['id'],'source':source,'period':period,'item':item,'amount':amount,'paid':0,'due':due.isoformat(),'coverage_end':coverage_end.isoformat()}
+                available[bill_id]=bill;created_bills+=1
+            else: matched_bills+=1
+            remaining=bill['amount']-bill['paid']-planned.get(bill['id'],0)
+            if paid>remaining: raise ValueError('实收金额超过该账单剩余应缴金额')
+            planned[bill['id']]=planned.get(bill['id'],0)+paid
+            receipt=row.get('receipt_ref','') or ref
+            if len(receipt)>100: raise ValueError('同次收款号不能超过100个字符')
+            payment_id='histpay-'+uuid.uuid5(uuid.NAMESPACE_URL,'tutu-history-payment:'+receipt).hex
+            if c.execute('SELECT 1 FROM payments WHERE id=?',(payment_id,)).fetchone(): raise ValueError('该同次收款号已经导入，请勿重复提交')
+            method=row.get('method','') or '现金'; note=row.get('note','')
+            group=groups.setdefault(payment_id,{'date':paid_date.isoformat(),'method':method,'note':note,'receipt':receipt,'allocations':{}})
+            if (group['date'],group['method'],group['note'])!=(paid_date.isoformat(),method,note): raise ValueError('同次收款号的收款日期、方式和备注必须一致')
+            group['allocations'][bill['id']]=group['allocations'].get(bill['id'],0)+paid
+            prepared.append({'ref':ref,'payment_id':payment_id,'bill_id':bill['id']})
+        except (ValueError,KeyError,sqlite3.IntegrityError) as e: errors.append({'row':line,'message':str(e)})
+    if not prepared and not errors: errors.append({'row':2,'message':'表格没有可导入的数据'})
+    if not errors:
+        for payment_id,group in groups.items():
+            total=sum(group['allocations'].values())
+            c.execute('INSERT INTO payments(id,date,amount,method,note,void,created) VALUES(?,?,?,?,?,0,?)',(payment_id,group['date'],total,group['method'],group['note'],now()))
+            for bill_id,value in group['allocations'].items(): c.execute('INSERT INTO allocations VALUES(?,?,?)',(payment_id,bill_id,value))
+        for row in prepared: c.execute('INSERT INTO history_imports VALUES(?,?,?,?)',(row['ref'],row['payment_id'],row['bill_id'],now()))
+        audit(c,'批量导入往期缴费',{'rows':len(prepared),'bills_created':created_bills,'bills_matched':matched_bills,'payments':len(groups),'refs':[x['ref'] for x in prepared]})
+    if errors or data.get('preview',True): c.execute('ROLLBACK TO history_payment_batch')
+    c.execute('RELEASE history_payment_batch')
+    return {'count':len(prepared),'bill_count':created_bills,'matched_count':matched_bills,'payment_count':len(groups),'errors':errors,'committed':not errors and not data.get('preview',True)}
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self,*args): pass
     def reply(self,data,status=200,ctype='application/json; charset=utf-8',filename=None):
@@ -581,10 +722,16 @@ class Handler(BaseHTTPRequestHandler):
                 kind=q.get('kind',['houses'])[0]
                 with connect() as c: result=xlsx(export_rows(c,kind,q.get('template',['0'])[0]=='1'))
                 return self.reply(result,ctype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',filename=kind+'.xlsx')
+            if u.path=='/api/history-payment-template':
+                return self.reply(history_payment_template(),ctype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',filename='history-payments-template.xlsx')
+            if u.path=='/api/bill-export':
+                filters={key:q.get(key,[''])[0] for key in ['start','end','house_id','item','status']}
+                with LOCK,connect() as c: result=bill_export(c,filters)
+                return self.reply(result,ctype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',filename='bills.xlsx')
             if u.path=='/api/backup':
                 with LOCK,connect() as c:
                     result={k:records(c,k) for k in TABLES}
-                    result.update(format=1,settings=settings(c),bills=[dict(r) for r in c.execute('SELECT * FROM bills')],payments=[dict(r) for r in c.execute('SELECT * FROM payments')],allocations=[dict(r) for r in c.execute('SELECT * FROM allocations')],audit=[dict(r) for r in c.execute('SELECT * FROM audit')])
+                    result.update(format=1,settings=settings(c),bills=[dict(r) for r in c.execute('SELECT * FROM bills')],payments=[dict(r) for r in c.execute('SELECT * FROM payments')],allocations=[dict(r) for r in c.execute('SELECT * FROM allocations')],history_imports=[dict(r) for r in c.execute('SELECT * FROM history_imports')],audit=[dict(r) for r in c.execute('SELECT * FROM audit')])
                 return self.reply(json.dumps(result,ensure_ascii=False,indent=2).encode(),ctype='application/json',filename='tutu-property-backup-'+TODAY().isoformat()+'.json')
             path={'/':'index.html','/app.js':'app.js','/style.css':'style.css'}.get(u.path)
             if not path: return self.reply({'error':'未找到'},404)
@@ -634,6 +781,7 @@ class Handler(BaseHTTPRequestHandler):
                     if not p or p['void']: raise ValueError('收款不存在或已撤销')
                     c.execute('UPDATE payments SET void=1 WHERE id=?',(data['id'],)); audit(c,'整笔撤销/退款',data); result={'ok':True}
                 elif path=='/api/import': result=import_rows(c,data['kind'],data)
+                elif path=='/api/history-payment-import': result=import_history_payments(c,data)
                 elif path=='/api/restore':
                     backup=json.loads(base64.b64decode(data['content']).decode('utf-8-sig'))
                     if backup.get('format')!=1: raise ValueError('不是本系统的备份文件')
@@ -641,7 +789,7 @@ class Handler(BaseHTTPRequestHandler):
                     dest=DB_PATH.parent/'backups'; dest.mkdir(parents=True,exist_ok=True)
                     dest_file=dest/('before-restore-'+dt.datetime.now().strftime('%Y%m%d-%H%M%S-%f')+'.db')
                     with sqlite3.connect(dest_file, factory=ClosingConnection) as target: c.backup(target)
-                    for table in ['allocations','payments','bills','records','audit']: c.execute('DELETE FROM '+table)
+                    for table in ['history_imports','allocations','payments','bills','records','audit']: c.execute('DELETE FROM '+table)
                     c.execute('UPDATE settings SET data=? WHERE id=1',(json.dumps({**DEFAULTS,**backup['settings']}),))
                     for kind in TABLES:
                         for r in backup.get(kind,[]):
@@ -651,7 +799,7 @@ class Handler(BaseHTTPRequestHandler):
                             if kind=='fees' and 'target_type' not in r:
                                 old=r.pop('house_id','');r.update(target_type='house' if old else 'all_houses',target_community='',target_building='',target_unit='',target_id=old,interval_months='')
                             c.execute('INSERT INTO records VALUES(?,?,?)',(kind,key,json.dumps(r)))
-                    for table in ['bills','payments','allocations','audit']:
+                    for table in ['bills','payments','allocations','history_imports','audit']:
                         columns=[r[1] for r in c.execute('PRAGMA table_info('+table+')')]
                         defaults={'coverage_end':'','group_key':'','entity_type':'house','entity_id':''}
                         for r in backup.get(table,[]): c.execute('INSERT INTO '+table+'('+','.join(columns)+') VALUES('+','.join('?' for _ in columns)+')',[r.get(k,defaults.get(k)) for k in columns])
